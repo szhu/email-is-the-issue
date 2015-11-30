@@ -152,7 +152,7 @@ ThreadProxy = (function() {
     if (this._props != null) {
       return this._props;
     }
-    props = JSON.parse(this.rawProps());
+    props = this.rawProps() != null ? JSON.parse(this.rawProps()) : {};
     if (props.githubIssueId == null) {
       props.githubIssueId = null;
     }

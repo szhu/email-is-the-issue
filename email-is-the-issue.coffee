@@ -94,7 +94,7 @@ class ThreadProxy
   props: ->
     return @_props if @_props?
 
-    props = JSON.parse @rawProps()
+    props = if @rawProps()? then JSON.parse @rawProps() else {}
 
     # Set default props
     props.githubIssueId ?= null
