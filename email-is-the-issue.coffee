@@ -1,11 +1,18 @@
+log = (msg) ->
+  Logger.log "LOG " + msg
+
+warn = (msg) ->
+  Logger.log "WARN " + msg
+
+
 class Github
-  constructor: (personalAccessToken) ->
-    @personalAccessToken = personalAccessToken
+  emailList: ->
+    return "#{Settings.githubRepoName}.#{Settings.githubRepoOrg}.github.com"
 
   fetch: (url, method, payload) ->
-    fullUrl = "https://api.github.com#{url}"
+    fullUrl = "https://api.github.com/repos/#{Settings.githubRepoOrg}/#{Settings.githubRepoName}#{url}"
 
-    username = @personalAccessToken
+    username = Settings.githubPersonalAccessToken
     password = 'x-oauth-basic'
     auth = "Basic " + Utilities.base64Encode("#{username}:#{password}")
 
@@ -21,187 +28,336 @@ class Github
     @fetch(url, 'get')
 
 
+class ThreadProxy
+  @fromRaw: (rawThread, propsStorage) ->
+    thread = new ThreadProxy()
+    thread._raw = rawThread
+    thread._propsStorage = propsStorage
+    thread._seenBodyRegexps = []
+    return thread
+
+  @fromId: (threadId, propsStorage) ->
+    thread = new ThreadProxy()
+    thread._selectorId = threadId
+    thread._propsStorage = propsStorage
+    thread._seenBodyRegexps = []
+    return thread
+
+  selectorId: -> @_selectorId
+
+  raw: -> @_raw ?= GmailApp.getThreadById(@selectorId())
+
+  messages: -> @_messages ?= (new MessageProxy(@, rawMessage) for rawMessage in @raw().getMessages())
+
+  firstMessage: -> @messages()[0]
+
+  lastMessage: -> @messages()[@messages().length - 1]
+
+  ### This one saves us a few API calls lol ###
+  lastMessageId: -> @_lastMessageId ?= @raw().getId()
+
+  firstMessageSubject: -> @_firstMessageSubject ?= @raw().getFirstMessageSubject()
+
+  permalink: -> @_permalink ?= @raw().getPermalink()
+
+  ###
+  An older version of this script used GmailThread.getId(), which did not return
+  a persistent ID -- it returned the ID of the last message, not the first.
+  @firstMessage().id() would be a more reliable way to get the ID. But because
+  we have messages saved under the old key, we should try try getting props
+  under both before concluding that the props don't exit for that thread.
+
+  https://developers.google.com/apps-script/reference/gmail/gmail-thread#getid
+  ###
+  propsKey: ->
+    return @_propsKey if @_propsKey?
+
+    if @selectorId()?
+      @_propsKey = "thread-#{@selectorId()}"
+      @_rawProps = @_propsStorage.getProperty(@_propsKey)
+      return @_propsKey
+
+    @_propsKey = "thread-#{@firstMessage().id()}"
+    @_rawProps = @_propsStorage.getProperty(@_propsKey)
+    return @_propsKey if @_rawProps?
+    
+    @_propsKey = "thread-#{@lastMessage().id()}"
+    @_rawProps = @_propsStorage.getProperty(@_propsKey)
+    return @_propsKey if @_rawProps?
+
+    return @_propsKey = "thread-#{@firstMessage().id()}"
+
+  rawProps: ->
+    @propsKey()
+    return @_rawProps
+
+  props: ->
+    return @_props if @_props?
+
+    props = JSON.parse @rawProps()
+
+    # Set default props
+    props.githubIssueId ?= null
+    props.convertedMessages ?= {}
+    props.lastSeenClosedAt ?= null
+    return @_props = props
+
+  saveProps: ->
+    @_propsStorage.setProperty(@propsKey(), JSON.stringify(@props()))
+    return
+
+  didConvertMessage: (message) ->
+    return message.id() of @props().convertedMessages
+
+
+class MessageProxy
+  constructor: (threadProxy, rawMessage) ->
+    @_thread = threadProxy
+    @_raw = rawMessage
+
+  thread: -> @_thread
+
+  raw: -> @_raw
+
+  id: -> @_id ?= @raw().getId()
+
+  didConvert: ->
+    @thread().didConvertMessage(@)
+
+  body: ->
+    return @_body if @_body?
+    body = @raw().getBody()
+
+    # Try to avoid avoid representation variations
+    body = body.replace(/\n/g, '')
+    body = body.replace(/\s+/g, ' ')
+    body = body.replace(/(<br\s*(\s+[\w-]+(="[^"]*")?)*)(>)/g, '$1 /$4')
+    body = body.replace(/(<hr\s*(\s+[\w-]+(="[^"]*")?)*)(>)/g, '$1 /$4')
+
+    # The following is deprecated; also, it adds extra things.
+    # body = Xml.parse(body, true).html.body.toXmlString()
+    # The following doesn't work because of self-closing tags.
+    # body = XmlService.getRawFormat().format(XmlService.parse(body))
+
+    return @_body = body
+
+  ###
+  Remember this for cutting off parts of future messages Note: This feature
+  requires that this method be called for messages quoted messages before being
+  called for the messages that quote them. The easiest way to do this is to go
+  through all messages in time order, which is exactly what we do.
+  ###
+  addToQuoteDb: ->
+    quoteRegex = (literal) -> literal.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')
+    bodyRegexp = new RegExp(
+
+      # Apple Mail adds this; remove if possible
+      '(' + quoteRegex('<br /><div>') + ')?' +
+
+      # The first snippet of the quoted part
+      quoteRegex(@body().substring(0, 1000)) +
+
+      # Hopefully nothing important comes afterwards
+      '.*'
+    )
+    @thread()._seenBodyRegexps.unshift bodyRegexp
+
+  markdown: ->
+    return @_markdown if @_markdown?
+
+    body = @body()
+
+    # Cut off quoted text
+    for seenBodyRegexp in @thread()._seenBodyRegexps
+      body = body.replace(seenBodyRegexp, '<div style="padding:5 0"><font size="1" color="#888888">[Quoted text hidden]</font></div>')
+
+    formatList = (pre, list) -> if list.length > 0 then "**#{pre}:** #{list}\n".replace(/</g, '\\<') else ""
+    formatElse = (pre, list) -> "**#{pre}:** #{list}\n".replace(/</g, '\\<')
+
+    @_markdown = (
+      formatElse('From', @raw().getFrom()) +
+      formatElse('To', @raw().getTo()) +
+      formatList('Cc', @raw().getCc()) +
+      formatList('Bcc', @raw().getBcc()) +
+      formatElse('Date', @raw().getDate()) +
+      "\n---\n" +
+      "**#{@raw().getSubject()}**" +
+      "\n\n" +
+      "#{body}"
+    )
+
+
+class GmailLastMessageMarker
+  constructor: (app, propsStorage) ->
+    @_app = app
+    @_propsStorage = propsStorage
+    @_key = 'last-message'
+    @_position = @_propsStorage.getProperty(@key())
+
+  key: -> @_key
+
+  position: -> @_position
+
+  currentPosition: -> @_currentPosition ?= @_app.lastThread().lastMessageId()
+
+  isBehind: -> @position() != @currentPosition()
+
+  update: -> @_propsStorage.setProperty(@key(), @currentPosition())
+
+
 class App
-  constructor: (user, repo) ->
-    @user = user
-    @repo = repo
-    @userRepo = "#{user}/#{repo}"
+  constructor: ->
     @props = PropertiesService.getScriptProperties()
 
-  getThreadPropsById: (threadId) ->
-    key = "thread-#{threadId}"
-    rawThreadProps = @props.getProperty(key)
-    threadProps = if rawThreadProps? then JSON.parse(rawThreadProps) else {}
-    threadProps.githubIssueId ?= null
-    threadProps.convertedMessages ?= {}
-    threadProps.lastSeenClosedAt ?= null
-    return threadProps
+  gmailLabel: -> @_gmailLabel ?= GmailApp.getUserLabelByName(Settings.gmailLabelName)
 
-  getThreadProps: (thread) ->
-    @getThreadPropsById(thread.getId())
 
-  setThreadProps: (thread, props) ->
-    key = "thread-#{thread.getId()}"
-    return @props.setProperty(key, JSON.stringify(props))
+  ###
+  Getting different kinds of threads
+  ###
 
-  getLatestMessageId: ->
-    latestThread = GmailApp.search("*", 0, 1)[0]
-    return "#{latestThread.getId()}-#{latestThread.getLastMessageDate()}"
+  proxify: (rawThreads) -> (new ThreadProxy.fromRaw(rawThread, @props) for rawThread in rawThreads)
 
-  gmailHasChanged: ->
-    @latestMessageId = @getLatestMessageId()
-    return @latestMessageId == @props.getProperty('latest-message')
+  lastThread: -> @_lastThread ?= @proxify(GmailApp.search("*", 0, 1))[0]
 
-  updateGmailHasChangedMarker: ->
-    unless @latestMessageId?
-      Logger.log "WARN @latestMessageId not set"
-      return
-    @props.setProperty('latest-message', @latestMessageId)
+  labeledThreads: (howManyThreads) -> @proxify @gmailLabel().getThreads(0, howManyThreads)
 
-  getGmailLabel: ->
-    @_gmailLabel ?= GmailApp.getUserLabelByName(GMAIL_LABEL_NAME)
+  inboxUnlabeledThreads: (howManyThreads) ->
+    searchQuery = "in:inbox -list:#{GITHUB.emailList()} -label:\"#{Settings.gmailLabelName}\""
+    return @proxify GmailApp.search(searchQuery).slice(-howManyThreads).reverse()
+
+
+  ###
+  Checking if any new messages have arrived since last check
+  ###
+
+  lastMessageMarker: -> @_lastMessageMarker ?= new GmailLastMessageMarker(@, @props)
+
+
+  ###
+  Locks
+  ###
+
+  lock: -> @_lock ?= LockService.getScriptLock()
+
+  grabLock: ->
+    @lock().waitLock(10)
+    return
+
+  releaseLock: ->
+    @lock().releaseLock()
+    return
+
+
+  ###
+  Main Tasks
+  ###
 
   checkLabeledThreadsForNewMesssages: (howManyThreads) ->
-    lock = LockService.getScriptLock()
-    lock.waitLock(10)
-
-    firstThread = true
-
-    for thread in @getGmailLabel().getThreads(0, howManyThreads)
-      if firstThread
-        messages = thread.getMessages()
-        lastMessage = messages[messages.length - 1]
-
-        if something == something
-          lock.releaseLock()
-          return
-
-      firstThread = false
-
-      @createIssueCommentsFromThread(thread)
-
-    lock.releaseLock()
+    @createIssueCommentsFromThread(thread) for thread in @labeledThreads(howManyThreads)
     return
 
   checkInboxForNewThreads: (howManyThreads) ->
-    lock = LockService.getScriptLock()
-    lock.waitLock(10)
-
-    threads = GmailApp.search("in:inbox -list:#{@repo}.#{@user}.github.com -label:\"#{GMAIL_LABEL_NAME}\"")
-    threads.reverse()
-    for thread in threads
-      break if howManyThreads <= 0
-      howManyThreads -= 1
+    for thread in @inboxUnlabeledThreads(howManyThreads)
       @createIssueFromThread(thread)
       @createIssueCommentsFromThread(thread)
 
-    lock.releaseLock()
-    return
-
   checkClosedIssuesForArchiving: (howManyIssues) ->
-    lock = LockService.getScriptLock()
-    lock.waitLock(10)
-
-    for issue in GITHUB.get "/repos/#{@userRepo}/issues?sort=updated&state=closed&labels=#{GITHUB_LABEL_NAME}"
-      break if howManyIssues <= 0
-      howManyIssues -= 1
-
+    url = "/issues?sort=updated&state=closed&labels=#{Settings.githubLabelName}"
+    for issue in GITHUB.get(url).slice(0, howManyIssues)
       threadId = issue.body.match(/View thread ([0-9a-f]+) in Gmail/)?[1]
       if not threadId?
-        Logger.log("WARN can't find thread id for issue #{issue.number}")
+        warn "Can't find thread id for issue #{issue.number}"
         continue
 
-      threadProps = @getThreadPropsById(threadId)
-      if not threadProps.githubIssueId == issue.number
-        Logger.log("WARN issue #{issue.number} references thread #{threadId}, whose recorded issue number is different (#{threadProps.githubIssueId})")
+      thread = ThreadProxy.fromId(threadId, @props)
+      if not thread.props().githubIssueId == issue.number
+        warn "Issue #{issue.number} references thread #{threadId}"
+        warn "but #{threadId}'s props indicates that its issue number is (#{thread.props().githubIssueId})"
         continue
 
-      if threadProps.lastSeenClosedAt == issue.closed_at
+      if thread.props().lastSeenClosedAt == issue.closed_at
         continue
 
-      Logger.log("archiving thread #{threadId} because issue #{issue.number} was closed")
-      thread = GmailApp.getThreadById(threadId)
-      if not thread?
-        Logger.log("WARN can't find thread id #{threadId}")
+      log "LOG Archiving thread #{threadId} because issue #{issue.number} was closed"
+      if not thread.raw()?
+        warn "can't find thread id #{threadId}"
         continue
-      thread.moveToArchive()
-      Logger.log("done")
+      thread.raw().moveToArchive()
+      log "LOG done"
 
-      threadProps.lastSeenClosedAt = issue.closed_at
-      @setThreadProps(thread, threadProps)
+      thread.props().lastSeenClosedAt = issue.closed_at
+      thread.saveProps()
 
-    lock.releaseLock()
     return
 
   createIssueFromThread: (thread) ->
-    threadProps = @getThreadProps(thread)
+    issue = GITHUB.post "/issues",
+      title: thread.firstMessageSubject()
+      body: "[View thread #{thread.firstMessage().id()} in Gmail](#{thread.permalink()})"
+      labels: [ Settings.githubLabelName ]
 
-    issue = GITHUB.post "/repos/#{@userRepo}/issues",
-      title: thread.getFirstMessageSubject()
-      body: "[View thread #{thread.getId()} in Gmail](#{thread.getPermalink()})"
-      labels: [ GITHUB_LABEL_NAME ]
+    thread.props().githubIssueId = issue.number
+    thread.props().convertedMessages = {}
+    thread.saveProps()
 
-    threadProps.githubIssueId = issue.number
-    threadProps.convertedMessages = {}
-    @setThreadProps(thread, threadProps)
-
-    thread.addLabel(@getGmailLabel())
+    thread.raw().addLabel(@gmailLabel())
     return
 
   createIssueCommentsFromThread: (thread) ->
-    threadProps = @getThreadProps(thread)
-    Logger.log(threadProps)
+    log JSON.stringify thread.props()
 
-    unless threadProps.githubIssueId?
-      Logger.log("WARN thread #{thread.getId()} has \"#{GMAIL_LABEL_NAME}\" Gmail label but no associated GitHub issue")
+    unless thread.props().githubIssueId?
+      warn "#{thread.propsKey()} has \"#{Settings.gmailLabelName}\" Gmail label but no associated GitHub issue"
       return
 
-    for message in thread.getMessages()
-      messageId = message.getId()
-      continue if messageId of threadProps.convertedMessages
+    for message in thread.messages()
+      unless message.didConvert()
+        issueComment = GITHUB.post "/issues/#{thread.props().githubIssueId}/comments",
+          body: message.markdown()
 
-      formatList = (pre, list) -> if list.length > 0 then "**#{pre}:** #{list}\n".replace(/</g, '\\<') else ""
-      formatElse = (pre, list) -> "**#{pre}:** #{list}\n".replace(/</g, '\\<')
+        thread.props().convertedMessages[message.id()] = issueComment.id
+        log JSON.stringify thread.props()
+        thread.saveProps()
 
-      formattedMessage = (
-        formatElse('From', message.getFrom()) +
-        formatElse('To', message.getTo()) +
-        formatList('Cc', message.getCc()) +
-        formatList('Bcc', message.getBcc()) +
-        formatElse('Date', message.getDate()) +
-        "\n---\n" +
-        "**#{message.getSubject()}**" +
-        "\n\n" +
-        "#{message.getBody().replace(/\n/g, '')}"
-      )
-
-      issueComment = GITHUB.post "/repos/#{@userRepo}/issues/#{threadProps.githubIssueId}/comments",
-        body: formattedMessage
-
-      threadProps.convertedMessages[messageId] = issueComment.id
-      Logger.log(threadProps)
-      @setThreadProps(thread, threadProps)
+      message.addToQuoteDb()
     return
 
   checkAll: ->
+    @grabLock()
     @checkClosedIssuesForArchiving(15)
-    if @gmailHasChanged()
+    if @lastMessageMarker().isBehind()
       @checkLabeledThreadsForNewMesssages(15)
       @checkInboxForNewThreads(15)
-      @updateGmailHasChangedMarker()
+      @lastMessageMarker().update()
     else
-      Logger.log "no new messages; latest message = #{@latestMessageId}"
+      log "no new messages; last message = #{@lastMessageMarker().currentPosition()}"
+    @releaseLock()
+
+
+APP = new App()
+GITHUB = new Github()
 
 `
 function main() { APP.checkAll() }
 function noop() { }
 
+function clearLatestThreadProp() {
+  PropertiesService.getScriptProperties().setProperty('last-message', '');
+}
 function deleteAllThreadProps() {
-  return this.props = PropertiesService.getScriptProperties().deleteAllProperties();
+  // This is a destructive action -- uncomment below to enable
+  // PropertiesService.getScriptProperties().deleteAllProperties();
 }
 
-GMAIL_LABEL_NAME = "added to GitHub";
-GITHUB_LABEL_NAME = "from-email";
-// APP = new App('YOUR_ORG_OR_USER_HERE', 'YOUR_REPO_NAME_HERE');  // replace with actual values!
-// GITHUB = new Github('YOUR_API_KEY_HERE');  // replace with actual values!
-`
+/*
+Settings = {
+  gmailLabelName: "added to GitHub",
+  githubLabelName: "from-email",
+
+  githubPersonalAccessToken: "YOUR_API_KEY_HERE",
+
+  githubRepoOrg: "YOUR_ORG_OR_USER_HERE",
+  githubRepoName: "YOUR_REPO_NAME_HERE",
+}
+*/`
